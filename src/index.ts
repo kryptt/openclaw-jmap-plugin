@@ -1,11 +1,16 @@
 import { definePluginEntry } from 'openclaw/plugin-sdk/plugin-entry'
 import { EventSource } from 'eventsource'
+import { readFileSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
   JMAP_URL, JMAP_ACCOUNT_EMAIL, JMAP_PASSWORD, INBOX_ONLY,
   EVENTSOURCE_URL, SESSION_URL,
   RECONNECT_BASE_MS, RECONNECT_MAX_MS,
   GATEWAY_URL, GATEWAY_TOKEN
 } from './config.js'
+
+const STATE_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', '.jmap-state')
 
 const LOG_PREFIX = '[jmap-plugin]'
 
@@ -79,6 +84,7 @@ async function fetchNewEmails (sinceState: string): Promise<void> {
     const changes = responses.find((r: any) => r[0] === 'Email/changes')?.[1] ?? {}
     const created: string[] = changes.created ?? []
     lastEmailState = changes.newState ?? lastEmailState
+    if (lastEmailState) saveState(lastEmailState)
 
     if (created.length === 0) return
 
@@ -351,7 +357,10 @@ function connectEventSource (): void {
           console.error(`${LOG_PREFIX} fetchNewEmails failed:`, err)
         )
       }
-      if (emailState) lastEmailState = emailState
+      if (emailState) {
+        lastEmailState = emailState
+        saveState(emailState)
+      }
     } catch (err) {
       console.error(`${LOG_PREFIX} Failed to parse state event:`, err)
     }
@@ -380,12 +389,45 @@ function scheduleReconnect (): void {
   setTimeout(() => connectEventSource(), delay)
 }
 
+function loadSavedState (): string | null {
+  try {
+    return readFileSync(STATE_FILE, 'utf-8').trim() || null
+  } catch {
+    return null
+  }
+}
+
+function saveState (state: string): void {
+  try {
+    writeFileSync(STATE_FILE, state, 'utf-8')
+  } catch (err) {
+    console.error(`${LOG_PREFIX} Failed to save state:`, err)
+  }
+}
+
 async function getInitialEmailState (): Promise<void> {
   if (!accountId) return
+
+  // Get current server state
   const responses = await jmapRequest([['Email/get', { accountId, ids: [], properties: [] }, 's0']])
   const result = responses.find((r: any) => r[0] === 'Email/get')?.[1] ?? {}
-  lastEmailState = result.state ?? null
-  if (lastEmailState) console.log(`${LOG_PREFIX} Initial email state: ${lastEmailState}`)
+  const serverState = result.state ?? null
+
+  // Load saved state from disk — if we have one, catch up missed emails
+  const savedState = loadSavedState()
+
+  if (savedState && serverState && savedState !== serverState) {
+    console.log(`${LOG_PREFIX} Catching up: saved state ${savedState} → server state ${serverState}`)
+    lastEmailState = savedState
+    await fetchNewEmails(savedState)
+  } else {
+    lastEmailState = serverState
+  }
+
+  if (lastEmailState) {
+    saveState(lastEmailState)
+    console.log(`${LOG_PREFIX} Email state: ${lastEmailState}`)
+  }
 }
 
 // --- Plugin Entry ---
