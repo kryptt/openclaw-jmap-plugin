@@ -1,0 +1,26 @@
+{
+  "name": "@hr-home/openclaw-jmap-plugin",
+  "version": "0.1.0",
+  "type": "module",
+  "dependencies": {
+    "jmap-jam": "^0.6.0",
+    "eventsource": "^3.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.0.5"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "openclaw": {
+    "extensions": [
+      "./src/index.ts"
+    ],
+    "compat": {
+      "pluginApi": ">=2026.4.5"
+    }
+  }
+}
