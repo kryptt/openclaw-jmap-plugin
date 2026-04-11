@@ -122,6 +122,121 @@ async function isInInbox (mailboxIds: string[]): Promise<boolean> {
   return inboxMailboxId != null && mailboxIds.includes(inboxMailboxId)
 }
 
+// --- Gateway WebSocket ---
+
+let ws: WebSocket | null = null
+let wsReady: Promise<void> | null = null
+let wsConnected = false
+const wsPending = new Map<string, { resolve: (v: string) => void, reject: (e: Error) => void, timeout: ReturnType<typeof setTimeout> }>()
+const chatPromises = new Map<string, { resolve: (v: string) => void, reject: (e: Error) => void, timeout: ReturnType<typeof setTimeout>, text: string }>()
+
+function uuid (): string { return crypto.randomUUID() }
+
+function ensureGateway (): Promise<void> {
+  if (wsReady && wsConnected) return wsReady
+  if (wsReady) return wsReady
+
+  wsReady = new Promise<void>((resolve, reject) => {
+    const url = GATEWAY_URL.replace(/^http/, 'ws')
+    console.log(`${LOG_PREFIX} Connecting WebSocket to ${url}`)
+    const socket = new WebSocket(url)
+
+    socket.addEventListener('open', () => {
+      const connectId = uuid()
+      socket.send(JSON.stringify({
+        type: 'req', id: connectId, method: 'connect',
+        params: {
+          minProtocol: 3, maxProtocol: 3,
+          client: { id: 'jmap-plugin', version: '0.1.0', platform: 'node', mode: 'cli', instanceId: uuid() },
+          role: 'operator',
+          scopes: ['operator.admin', 'operator.read', 'operator.write', 'operator.approvals', 'operator.pairing'],
+          caps: ['tool-events'],
+          ...(GATEWAY_TOKEN ? { auth: { token: GATEWAY_TOKEN } } : {})
+        }
+      }))
+
+      const onConnect = (event: MessageEvent): void => {
+        try {
+          const msg = JSON.parse(String(event.data))
+          if (msg.id === connectId) {
+            socket.removeEventListener('message', onConnect)
+            if (msg.error) { reject(new Error(`Gateway connect: ${JSON.stringify(msg.error)}`)); return }
+            wsConnected = true; ws = socket
+            console.log(`${LOG_PREFIX} Gateway WebSocket connected`)
+            resolve()
+          }
+        } catch {}
+      }
+      socket.addEventListener('message', onConnect)
+      setTimeout(() => { if (!wsConnected) { socket.removeEventListener('message', onConnect); reject(new Error('WS connect timeout')) } }, 10_000)
+    })
+
+    socket.addEventListener('message', (event) => {
+      if (!wsConnected) return
+      try {
+        const msg = JSON.parse(String(event.data))
+        if (msg.id && wsPending.has(msg.id)) {
+          const p = wsPending.get(msg.id)!; wsPending.delete(msg.id); clearTimeout(p.timeout)
+          msg.error ? p.reject(new Error(JSON.stringify(msg.error))) : p.resolve(msg.result ? JSON.stringify(msg.result) : 'ok')
+          return
+        }
+        // Stream events for chat responses
+        if (msg.type === 'event' && msg.event === 'chat') {
+          const payload = msg.payload; if (!payload) return
+          const content = payload.message?.content
+          if (content && Array.isArray(content)) {
+            for (const block of content) {
+              if (block.type === 'text' && typeof block.text === 'string') {
+                for (const [, cp] of chatPromises) cp.text += block.text
+              }
+            }
+          }
+          if (payload.state === 'final' || payload.state === 'error') {
+            for (const [key, cp] of chatPromises) {
+              clearTimeout(cp.timeout); chatPromises.delete(key)
+              payload.state === 'error' ? cp.reject(new Error(payload.errorMessage ?? 'unknown')) : cp.resolve(cp.text || '(no response)')
+              break
+            }
+          }
+        }
+      } catch {}
+    })
+
+    socket.addEventListener('close', () => {
+      wsConnected = false; wsReady = null; ws = null
+      for (const [, p] of wsPending) { clearTimeout(p.timeout); p.reject(new Error('WS closed')) }
+      wsPending.clear()
+      for (const [, cp] of chatPromises) { clearTimeout(cp.timeout); cp.reject(new Error('WS closed')) }
+      chatPromises.clear()
+    })
+
+    socket.addEventListener('error', (e) => console.error(`${LOG_PREFIX} WS error:`, (e as any).message ?? 'unknown'))
+    setTimeout(() => { if (!wsConnected) { socket.close(); reject(new Error('WS timeout')) } }, 15_000)
+  })
+  return wsReady
+}
+
+function sendGatewayRequest (method: string, params: Record<string, unknown>): Promise<string> {
+  return new Promise((resolve, reject) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) { reject(new Error('WS not connected')); return }
+    const id = uuid()
+    const timeout = setTimeout(() => { wsPending.delete(id); reject(new Error(`Request timeout: ${method}`)) }, 120_000)
+    wsPending.set(id, { resolve, reject, timeout })
+    ws.send(JSON.stringify({ type: 'req', id, method, params }))
+  })
+}
+
+async function gatewayChat (sessionKey: string, prompt: string): Promise<string> {
+  await ensureGateway()
+  const chatId = uuid()
+  const result = new Promise<string>((resolve, reject) => {
+    const timeout = setTimeout(() => { chatPromises.delete(chatId); reject(new Error('Chat timeout (300s)')) }, 300_000)
+    chatPromises.set(chatId, { resolve, reject, timeout, text: '' })
+  })
+  await sendGatewayRequest('chat.send', { sessionKey, message: prompt, deliver: true, idempotencyKey: uuid() })
+  return result
+}
+
 // --- Agent Dispatch ---
 
 async function deliverToAgent (email: any): Promise<void> {
@@ -150,24 +265,8 @@ async function deliverToAgent (email: any): Promise<void> {
   console.log(`${LOG_PREFIX} Delivering email from ${fromAddr}: "${subject}" (session: ${sessionKey})`)
 
   try {
-    const res = await fetch(`${GATEWAY_URL}/api/v1/chat`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(GATEWAY_TOKEN ? { Authorization: `Bearer ${GATEWAY_TOKEN}` } : {})
-      },
-      body: JSON.stringify({
-        message: prompt, sessionKey,
-        metadata: { channel: 'email', from: fromAddr, subject, messageId,
-          inReplyTo: email.inReplyTo, references: email.references }
-      })
-    })
-    if (!res.ok) {
-      console.error(`${LOG_PREFIX} Gateway returned ${res.status}: ${await res.text()}`)
-      return
-    }
-    const data = await res.json() as { response?: string }
-    if (data.response) await sendReply(email, data.response)
+    const response = await gatewayChat(sessionKey, prompt)
+    if (response) await sendReply(email, response)
   } catch (err) {
     console.error(`${LOG_PREFIX} Gateway dispatch failed:`, err)
   }
