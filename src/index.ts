@@ -190,11 +190,15 @@ function ensureGateway (): Promise<void> {
         if (msg.type === 'event' && msg.event === 'chat') {
           const payload = msg.payload; if (!payload) return
           const content = payload.message?.content
+          // Gateway streams cumulative text (full message at each point), not deltas.
+          // Replace rather than append to avoid tripling the content.
           if (content && Array.isArray(content)) {
-            for (const block of content) {
-              if (block.type === 'text' && typeof block.text === 'string') {
-                for (const [, cp] of chatPromises) cp.text += block.text
-              }
+            const fullText = content
+              .filter((b: any) => b.type === 'text' && typeof b.text === 'string')
+              .map((b: any) => b.text)
+              .join('')
+            if (fullText) {
+              for (const [, cp] of chatPromises) cp.text = fullText
             }
           }
           if (payload.state === 'final' || payload.state === 'error') {
