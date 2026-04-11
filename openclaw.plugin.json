@@ -1,0 +1,23 @@
+{
+  "id": "openclaw-jmap-plugin",
+  "kind": "integration",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "jmapUrl": { "type": "string" },
+      "accountEmail": { "type": "string" },
+      "inboxOnly": { "type": "boolean" }
+    }
+  },
+  "uiHints": {
+    "jmapUrl": {
+      "label": "JMAP Server URL",
+      "placeholder": "http://stalwart.system:8080"
+    },
+    "accountEmail": {
+      "label": "Account Email",
+      "placeholder": "roci@hr-home.xyz"
+    }
+  }
+}
