@@ -147,7 +147,7 @@ function ensureGateway (): Promise<void> {
         type: 'req', id: connectId, method: 'connect',
         params: {
           minProtocol: 3, maxProtocol: 3,
-          client: { id: 'jmap-plugin', version: '0.1.0', platform: 'node', mode: 'cli', instanceId: uuid() },
+          client: { id: 'openclaw-tui', version: '0.1.0', platform: 'node', mode: 'cli', instanceId: uuid() },
           role: 'operator',
           scopes: ['operator.admin', 'operator.read', 'operator.write', 'operator.approvals', 'operator.pairing'],
           caps: ['tool-events'],
