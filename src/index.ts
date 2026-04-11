@@ -12,7 +12,9 @@ const LOG_PREFIX = '[jmap-plugin]'
 
 // Basic auth header for Stalwart (jmap-jam only exposes bearerToken,
 // so we pass a dummy token and override via fetchInit)
-const basicAuth = `Basic ${Buffer.from(`${JMAP_ACCOUNT_EMAIL}:${JMAP_PASSWORD}`).toString('base64')}`
+// Stalwart authenticates by account name (not email)
+const JMAP_USERNAME = JMAP_ACCOUNT_EMAIL.split('@')[0]
+const basicAuth = `Basic ${Buffer.from(`${JMAP_USERNAME}:${JMAP_PASSWORD}`).toString('base64')}`
 const authFetchInit: RequestInit = {
   headers: { Authorization: basicAuth }
 }
