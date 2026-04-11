@@ -1,6 +1,5 @@
 import { definePluginEntry } from 'openclaw/plugin-sdk/plugin-entry'
 import { EventSource } from 'eventsource'
-import JamClient from 'jmap-jam'
 import {
   JMAP_URL, JMAP_ACCOUNT_EMAIL, JMAP_PASSWORD, INBOX_ONLY,
   EVENTSOURCE_URL, SESSION_URL,
@@ -10,73 +9,80 @@ import {
 
 const LOG_PREFIX = '[jmap-plugin]'
 
-// Basic auth header for Stalwart (jmap-jam only exposes bearerToken,
-// so we pass a dummy token and override via fetchInit)
 // Stalwart authenticates by account name (not email)
 const JMAP_USERNAME = JMAP_ACCOUNT_EMAIL.split('@')[0]
 const basicAuth = `Basic ${Buffer.from(`${JMAP_USERNAME}:${JMAP_PASSWORD}`).toString('base64')}`
-const authFetchInit: RequestInit = {
-  headers: { Authorization: basicAuth }
-}
+const authHeaders = { Authorization: basicAuth, 'Content-Type': 'application/json' }
 
-let jam: JamClient | null = null
+let apiUrl: string | null = null
 let accountId: string | null = null
 let eventSource: EventSource | null = null
 let lastEmailState: string | null = null
 let reconnectAttempts = 0
 let connected = false
 
-// --- JMAP Session & Client ---
+// --- Raw JMAP request helper ---
+
+async function jmapRequest (methodCalls: any[], using?: string[]): Promise<any[]> {
+  if (!apiUrl) throw new Error('JMAP client not initialized')
+  const capabilities = using ?? ['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail']
+  const body = JSON.stringify({ using: capabilities, methodCalls })
+  const res = await fetch(apiUrl, { method: 'POST', headers: authHeaders, body })
+  if (!res.ok) throw new Error(`JMAP request failed: ${res.status} ${await res.text()}`)
+  const data = await res.json() as any
+  return data.methodResponses ?? []
+}
+
+// --- JMAP Session ---
 
 async function initJmapClient (): Promise<void> {
-  // jmap-jam requires bearerToken; we override auth via fetchInit on each call.
-  // Pass a placeholder token — the fetchInit Authorization header takes precedence.
-  jam = new JamClient({
-    bearerToken: 'basic-auth-override',
-    sessionUrl: SESSION_URL,
-    fetchInit: authFetchInit
-  })
+  const sessionRes = await fetch(SESSION_URL, { headers: { Authorization: basicAuth }, redirect: 'follow' })
+  if (!sessionRes.ok) {
+    throw new Error(`JMAP session fetch failed: ${sessionRes.status} ${await sessionRes.text()}`)
+  }
+  const session = await sessionRes.json() as any
 
-  const session = await jam.session
-  // Find the primary account for mail capability
-  const accounts = session.accounts ?? {}
-  for (const [id, acct] of Object.entries(accounts)) {
-    if ((acct as any)?.isPersonal) {
-      accountId = id
-      break
+  apiUrl = session.apiUrl
+  // Replace hostname in apiUrl with internal service URL (session returns external hostname)
+  if (apiUrl && !apiUrl.startsWith('http://stalwart')) {
+    const url = new URL(apiUrl)
+    const internal = new URL(JMAP_URL)
+    url.protocol = internal.protocol
+    url.hostname = internal.hostname
+    url.port = internal.port
+    apiUrl = url.toString()
+  }
+
+  accountId = session.primaryAccounts?.['urn:ietf:params:jmap:mail'] ?? null
+  if (!accountId) {
+    const accounts = session.accounts ?? {}
+    for (const [id, acct] of Object.entries(accounts)) {
+      if ((acct as any)?.isPersonal) { accountId = id; break }
     }
-  }
-  // Fallback: use the primaryAccounts for mail
-  if (!accountId) {
-    accountId = (session as any).primaryAccounts?.['urn:ietf:params:jmap:mail'] ?? Object.keys(accounts)[0]
+    if (!accountId) accountId = Object.keys(accounts)[0] ?? null
   }
 
-  if (!accountId) {
-    throw new Error('No JMAP mail account found')
-  }
-  console.log(`${LOG_PREFIX} JMAP session established, accountId=${accountId}`)
+  if (!accountId) throw new Error('No JMAP mail account found')
+  console.log(`${LOG_PREFIX} JMAP session established, apiUrl=${apiUrl}, accountId=${accountId}`)
 }
 
 // --- Email Fetching ---
 
 async function fetchNewEmails (sinceState: string): Promise<void> {
-  if (!jam || !accountId) return
+  if (!accountId) return
 
   try {
-    // Get changed email IDs since last known state
-    const [changes] = await jam.request(
-      ['Email/changes', { accountId, sinceState }],
-      { fetchInit: authFetchInit }
-    )
+    const responses = await jmapRequest([
+      ['Email/changes', { accountId, sinceState }, 'c0']
+    ])
 
-    const created: string[] = (changes as any)?.created ?? []
-    if (created.length === 0) {
-      lastEmailState = (changes as any)?.newState ?? lastEmailState
-      return
-    }
+    const changes = responses.find((r: any) => r[0] === 'Email/changes')?.[1] ?? {}
+    const created: string[] = changes.created ?? []
+    lastEmailState = changes.newState ?? lastEmailState
 
-    // Fetch the new emails
-    const [emails] = await jam.request(
+    if (created.length === 0) return
+
+    const emailResponses = await jmapRequest([
       ['Email/get', {
         accountId,
         ids: created,
@@ -84,21 +90,18 @@ async function fetchNewEmails (sinceState: string): Promise<void> {
           'receivedAt', 'messageId', 'inReplyTo', 'references',
           'mailboxIds', 'bodyValues'],
         fetchTextBodyValues: true
-      }],
-      { fetchInit: authFetchInit }
-    )
+      }, 'e0']
+    ])
 
-    const emailList: any[] = (emails as any)?.list ?? []
-    lastEmailState = (changes as any)?.newState ?? lastEmailState
+    const emails = emailResponses.find((r: any) => r[0] === 'Email/get')?.[1] ?? {}
+    const emailList: any[] = emails.list ?? []
 
     for (const email of emailList) {
-      // Optionally filter to inbox only
       if (INBOX_ONLY) {
         const mailboxIds = email.mailboxIds ?? {}
         const inInbox = await isInInbox(Object.keys(mailboxIds))
         if (!inInbox) continue
       }
-
       await deliverToAgent(email)
     }
   } catch (err) {
@@ -106,18 +109,15 @@ async function fetchNewEmails (sinceState: string): Promise<void> {
   }
 }
 
-// Cache the inbox mailbox ID
 let inboxMailboxId: string | null = null
 
 async function isInInbox (mailboxIds: string[]): Promise<boolean> {
-  if (!inboxMailboxId && jam && accountId) {
-    const [mailboxes] = await jam.request(
-      ['Mailbox/get', { accountId, properties: ['id', 'role'] }],
-      { fetchInit: authFetchInit }
-    )
-    const list: any[] = (mailboxes as any)?.list ?? []
-    const inbox = list.find((m: any) => m.role === 'inbox')
-    inboxMailboxId = inbox?.id ?? null
+  if (!inboxMailboxId && accountId) {
+    const responses = await jmapRequest([
+      ['Mailbox/get', { accountId, properties: ['id', 'role'] }, 'm0']
+    ])
+    const list: any[] = responses.find((r: any) => r[0] === 'Mailbox/get')?.[1]?.list ?? []
+    inboxMailboxId = list.find((m: any) => m.role === 'inbox')?.id ?? null
   }
   return inboxMailboxId != null && mailboxIds.includes(inboxMailboxId)
 }
@@ -131,10 +131,8 @@ async function deliverToAgent (email: any): Promise<void> {
   const subject = email.subject ?? '(no subject)'
   const messageId = email.messageId?.[0] ?? email.id
 
-  // Extract plain text body
   let body = ''
-  const textParts: any[] = email.textBody ?? []
-  for (const part of textParts) {
+  for (const part of (email.textBody ?? [])) {
     const val = email.bodyValues?.[part.partId]
     if (val?.value) body += val.value
   }
@@ -146,8 +144,7 @@ async function deliverToAgent (email: any): Promise<void> {
     `Subject: ${subject}`,
     `Message-ID: ${messageId}`,
     email.inReplyTo ? `In-Reply-To: ${email.inReplyTo.join(', ')}` : '',
-    '',
-    body
+    '', body
   ].filter(Boolean).join('\n')
 
   console.log(`${LOG_PREFIX} Delivering email from ${fromAddr}: "${subject}" (session: ${sessionKey})`)
@@ -160,28 +157,17 @@ async function deliverToAgent (email: any): Promise<void> {
         ...(GATEWAY_TOKEN ? { Authorization: `Bearer ${GATEWAY_TOKEN}` } : {})
       },
       body: JSON.stringify({
-        message: prompt,
-        sessionKey,
-        metadata: {
-          channel: 'email',
-          from: fromAddr,
-          subject,
-          messageId,
-          inReplyTo: email.inReplyTo,
-          references: email.references
-        }
+        message: prompt, sessionKey,
+        metadata: { channel: 'email', from: fromAddr, subject, messageId,
+          inReplyTo: email.inReplyTo, references: email.references }
       })
     })
-
     if (!res.ok) {
       console.error(`${LOG_PREFIX} Gateway returned ${res.status}: ${await res.text()}`)
       return
     }
-
     const data = await res.json() as { response?: string }
-    if (data.response) {
-      await sendReply(email, data.response)
-    }
+    if (data.response) await sendReply(email, data.response)
   } catch (err) {
     console.error(`${LOG_PREFIX} Gateway dispatch failed:`, err)
   }
@@ -190,82 +176,20 @@ async function deliverToAgent (email: any): Promise<void> {
 // --- Outbound Reply ---
 
 async function sendReply (originalEmail: any, replyBody: string): Promise<void> {
-  if (!jam || !accountId) return
-
+  if (!accountId) return
   const from = originalEmail.from?.[0]
   const replyTo = from?.email
-  if (!replyTo) {
-    console.error(`${LOG_PREFIX} Cannot reply: no sender address on original email`)
-    return
-  }
+  if (!replyTo) { console.error(`${LOG_PREFIX} Cannot reply: no sender address`); return }
 
   const subject = originalEmail.subject?.startsWith('Re: ')
-    ? originalEmail.subject
-    : `Re: ${originalEmail.subject ?? '(no subject)'}`
-
+    ? originalEmail.subject : `Re: ${originalEmail.subject ?? '(no subject)'}`
   const originalMessageId = originalEmail.messageId?.[0]
-  const references = [
-    ...(originalEmail.references ?? []),
-    ...(originalMessageId ? [originalMessageId] : [])
-  ]
+  const references = [...(originalEmail.references ?? []), ...(originalMessageId ? [originalMessageId] : [])]
 
   try {
-    // Step 1: Create the draft email via Email/set
-    const [emailResult, emailMeta] = await jam.request(
-      ['Email/set', {
-        accountId,
-        create: {
-          draft: {
-            from: [{ email: JMAP_ACCOUNT_EMAIL }],
-            to: [{ email: replyTo, name: from?.name }],
-            subject,
-            inReplyTo: originalMessageId ? [originalMessageId] : undefined,
-            references: references.length > 0 ? references : undefined,
-            textBody: [{ partId: 'body', type: 'text/plain' }],
-            bodyValues: { body: { value: replyBody } },
-            keywords: { $draft: true, $seen: true },
-            mailboxIds: await getDraftsMailboxId()
-          }
-        }
-      }],
-      {
-        fetchInit: authFetchInit,
-        using: ['urn:ietf:params:jmap:mail']
-      }
-    )
-
-    const created = (emailResult as any)?.created?.draft
-    if (!created?.id) {
-      console.error(`${LOG_PREFIX} Email/set failed:`, (emailResult as any)?.notCreated)
-      return
-    }
-
-    const emailId = created.id
-
-    // Step 2: Submit the email via EmailSubmission/set
-    const identityId = await getIdentityId()
-    const [submitResult] = await jam.request(
-      ['EmailSubmission/set', {
-        accountId,
-        create: {
-          send: {
-            emailId,
-            identityId
-          }
-        }
-      }],
-      {
-        fetchInit: authFetchInit,
-        using: ['urn:ietf:params:jmap:submission']
-      }
-    )
-
-    const submitted = (submitResult as any)?.created?.send
-    if (submitted) {
-      console.log(`${LOG_PREFIX} Reply sent to ${replyTo} (subject: ${subject})`)
-    } else {
-      console.error(`${LOG_PREFIX} EmailSubmission/set failed:`, (submitResult as any)?.notCreated)
-    }
+    await createAndSubmitEmail(replyTo, subject, replyBody, originalMessageId,
+      references.length > 0 ? references : undefined)
+    console.log(`${LOG_PREFIX} Reply sent to ${replyTo} (subject: ${subject})`)
   } catch (err) {
     console.error(`${LOG_PREFIX} Reply send failed:`, err)
   }
@@ -277,16 +201,12 @@ let draftsMailboxId: Record<string, boolean> | null = null
 
 async function getIdentityId (): Promise<string> {
   if (identityId) return identityId
-  if (!jam || !accountId) throw new Error('JMAP client not initialized')
-
-  const [identities] = await jam.request(
-    ['Identity/get', { accountId }],
-    {
-      fetchInit: authFetchInit,
-      using: ['urn:ietf:params:jmap:submission']
-    }
+  if (!accountId) throw new Error('JMAP client not initialized')
+  const responses = await jmapRequest(
+    [['Identity/get', { accountId }, 'i0']],
+    ['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:submission']
   )
-  const list: any[] = (identities as any)?.list ?? []
+  const list: any[] = responses.find((r: any) => r[0] === 'Identity/get')?.[1]?.list ?? []
   const match = list.find((i: any) => i.email === JMAP_ACCOUNT_EMAIL) ?? list[0]
   if (!match?.id) throw new Error('No JMAP identity found')
   identityId = match.id
@@ -295,13 +215,9 @@ async function getIdentityId (): Promise<string> {
 
 async function getDraftsMailboxId (): Promise<Record<string, boolean>> {
   if (draftsMailboxId) return draftsMailboxId
-  if (!jam || !accountId) throw new Error('JMAP client not initialized')
-
-  const [mailboxes] = await jam.request(
-    ['Mailbox/get', { accountId, properties: ['id', 'role'] }],
-    { fetchInit: authFetchInit }
-  )
-  const list: any[] = (mailboxes as any)?.list ?? []
+  if (!accountId) throw new Error('JMAP client not initialized')
+  const responses = await jmapRequest([['Mailbox/get', { accountId, properties: ['id', 'role'] }, 'm0']])
+  const list: any[] = responses.find((r: any) => r[0] === 'Mailbox/get')?.[1]?.list ?? []
   const drafts = list.find((m: any) => m.role === 'drafts')
   if (!drafts?.id) throw new Error('No drafts mailbox found')
   draftsMailboxId = { [drafts.id]: true }
@@ -336,17 +252,13 @@ function connectEventSource (): void {
           console.error(`${LOG_PREFIX} fetchNewEmails failed:`, err)
         )
       }
-      // Update state from the push
       if (emailState) lastEmailState = emailState
     } catch (err) {
       console.error(`${LOG_PREFIX} Failed to parse state event:`, err)
     }
   })
 
-  eventSource.addEventListener('ping', () => {
-    // Keep-alive, reset reconnect counter
-    reconnectAttempts = 0
-  })
+  eventSource.addEventListener('ping', () => { reconnectAttempts = 0 })
 
   eventSource.onerror = () => {
     console.error(`${LOG_PREFIX} EventSource error, scheduling reconnect`)
@@ -369,18 +281,12 @@ function scheduleReconnect (): void {
   setTimeout(() => connectEventSource(), delay)
 }
 
-// --- Get initial email state ---
-
 async function getInitialEmailState (): Promise<void> {
-  if (!jam || !accountId) return
-  const [result] = await jam.request(
-    ['Email/get', { accountId, ids: [], properties: [] }],
-    { fetchInit: authFetchInit }
-  )
-  lastEmailState = (result as any)?.state ?? null
-  if (lastEmailState) {
-    console.log(`${LOG_PREFIX} Initial email state: ${lastEmailState}`)
-  }
+  if (!accountId) return
+  const responses = await jmapRequest([['Email/get', { accountId, ids: [], properties: [] }, 's0']])
+  const result = responses.find((r: any) => r[0] === 'Email/get')?.[1] ?? {}
+  lastEmailState = result.state ?? null
+  if (lastEmailState) console.log(`${LOG_PREFIX} Initial email state: ${lastEmailState}`)
 }
 
 // --- Plugin Entry ---
@@ -397,7 +303,6 @@ export default definePluginEntry({
         console.warn(`${LOG_PREFIX} ROCI_JMAP_PASSWORD not set, email channel disabled`)
         return
       }
-
       try {
         await initJmapClient()
         await getInitialEmailState()
@@ -408,7 +313,6 @@ export default definePluginEntry({
       }
     }
 
-    // Tool: email_send — allow the agent to send email proactively
     api.registerTool({
       name: 'email_send',
       label: 'Send Email',
@@ -430,18 +334,11 @@ export default definePluginEntry({
       },
       async execute (...rawArgs: any[]) {
         const args = (typeof rawArgs[0] === 'object' && rawArgs[0] !== null
-          ? rawArgs[0]
-          : rawArgs[1] ?? {}) as Record<string, string>
-
-        if (!jam || !accountId) {
-          return { content: [{ type: 'text', text: 'JMAP client not connected.' }] }
-        }
-
+          ? rawArgs[0] : rawArgs[1] ?? {}) as Record<string, string>
+        if (!accountId) return { content: [{ type: 'text', text: 'JMAP client not connected.' }] }
         try {
-          const references = args.inReplyTo ? [args.inReplyTo] : undefined
-          const emailId = await createAndSubmitEmail(
-            args.to, args.subject, args.body, args.inReplyTo, references
-          )
+          await createAndSubmitEmail(args.to, args.subject, args.body, args.inReplyTo,
+            args.inReplyTo ? [args.inReplyTo] : undefined)
           return { content: [{ type: 'text', text: `Email sent to ${args.to} (subject: ${args.subject})` }] }
         } catch (err) {
           return { content: [{ type: 'text', text: `Send failed: ${err}` }] }
@@ -455,14 +352,16 @@ export default definePluginEntry({
   }
 })
 
-// Shared email creation + submission logic
 async function createAndSubmitEmail (
   to: string, subject: string, body: string,
   inReplyTo?: string, references?: string[]
-): Promise<string> {
-  if (!jam || !accountId) throw new Error('JMAP client not initialized')
+): Promise<void> {
+  if (!accountId) throw new Error('JMAP client not initialized')
+  const draftsId = await getDraftsMailboxId()
+  const identId = await getIdentityId()
 
-  const [emailResult] = await jam.request(
+  // Create draft + submit in one JMAP request
+  const responses = await jmapRequest([
     ['Email/set', {
       accountId,
       create: {
@@ -475,39 +374,24 @@ async function createAndSubmitEmail (
           textBody: [{ partId: 'body', type: 'text/plain' }],
           bodyValues: { body: { value: body } },
           keywords: { $draft: true, $seen: true },
-          mailboxIds: await getDraftsMailboxId()
+          mailboxIds: draftsId
         }
       }
-    }],
-    {
-      fetchInit: authFetchInit,
-      using: ['urn:ietf:params:jmap:mail']
-    }
-  )
-
-  const created = (emailResult as any)?.created?.draft
-  if (!created?.id) {
-    throw new Error(`Email/set failed: ${JSON.stringify((emailResult as any)?.notCreated)}`)
-  }
-
-  const identityId = await getIdentityId()
-  const [submitResult] = await jam.request(
+    }, 'e0'],
     ['EmailSubmission/set', {
       accountId,
       create: {
-        send: { emailId: created.id, identityId }
+        send: { emailId: '#draft', identityId: identId }
       }
-    }],
-    {
-      fetchInit: authFetchInit,
-      using: ['urn:ietf:params:jmap:submission']
-    }
-  )
+    }, 's0']
+  ], ['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail', 'urn:ietf:params:jmap:submission'])
 
-  const submitted = (submitResult as any)?.created?.send
-  if (!submitted) {
-    throw new Error(`EmailSubmission/set failed: ${JSON.stringify((submitResult as any)?.notCreated)}`)
+  const emailResult = responses.find((r: any) => r[0] === 'Email/set')?.[1] ?? {}
+  if (!emailResult.created?.draft?.id) {
+    throw new Error(`Email/set failed: ${JSON.stringify(emailResult.notCreated)}`)
   }
-
-  return created.id
+  const submitResult = responses.find((r: any) => r[0] === 'EmailSubmission/set')?.[1] ?? {}
+  if (!submitResult.created?.send) {
+    throw new Error(`EmailSubmission/set failed: ${JSON.stringify(submitResult.notCreated)}`)
+  }
 }
