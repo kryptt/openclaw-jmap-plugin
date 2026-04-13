@@ -15,14 +15,13 @@ env:
   CLAWHUB_REPOSITORY: "openclaw/clawhub"
   CLAWHUB_REF: "4af2bd50a71465683dbf8aa269af764b9d39bdf5"
 
-permissions:
-  contents: read
-  id-token: write     # ClawHub OIDC publish token
-
 jobs:
   publish:
     runs-on: ubuntu-latest
     environment: clawhub-plugin-release
+    permissions:
+      contents: read
+      id-token: write     # ClawHub OIDC publish token
     steps:
       - uses: actions/checkout@v4
         with:
