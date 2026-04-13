@@ -436,6 +436,8 @@ async function getInitialEmailState (): Promise<void> {
 
 // --- Plugin Entry ---
 
+let initialized = false
+
 export default definePluginEntry({
   id: 'openclaw-jmap-plugin',
   name: 'Email Channel (JMAP)',
@@ -491,8 +493,11 @@ export default definePluginEntry({
       }
     })
 
+    if (initialized) return
+    initialized = true
+
     console.log(`${LOG_PREFIX} Starting JMAP init...`)
-    init().catch((err) => console.error(`${LOG_PREFIX} init failed:`, err))
+    init().catch((err) => { initialized = false; console.error(`${LOG_PREFIX} init failed:`, err) })
     console.log(`${LOG_PREFIX} Email Channel registered: 1 tool (email_send) + SSE push`)
   }
 })
