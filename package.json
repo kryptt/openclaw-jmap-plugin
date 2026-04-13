@@ -1,6 +1,6 @@
 {
   "name": "@kryptt/openclaw-jmap-plugin",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "description": "OpenClaw plugin: JMAP email integration \u2014 read/send/manage messages from any JMAP-compatible mail server",
   "type": "module",
   "license": "MIT",

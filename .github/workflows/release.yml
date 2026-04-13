@@ -48,4 +48,5 @@ jobs:
       dry_run: false
       json: true
       tags: latest
-    secrets: inherit
+    secrets:
+      clawhub_token: ${{ secrets.CLAWHUB_TOKEN }}
