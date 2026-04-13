@@ -39,11 +39,11 @@ jobs:
 
   publish:
     needs: verify
+    permissions:
+      contents: read
+      id-token: write
     uses: openclaw/clawhub/.github/workflows/package-publish.yml@4af2bd50a71465683dbf8aa269af764b9d39bdf5
     with:
       dry_run: false
       json: true
       tags: latest
-    permissions:
-      contents: read
-      id-token: write
