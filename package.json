@@ -1,7 +1,13 @@
 {
-  "name": "@hr-home/openclaw-jmap-plugin",
+  "name": "@kryptt/openclaw-jmap-plugin",
   "version": "0.1.0",
+  "description": "OpenClaw plugin: JMAP email integration — read/send/manage messages from any JMAP-compatible mail server",
   "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kryptt/openclaw-jmap-plugin.git"
+  },
   "dependencies": {
     "eventsource": "^3.0.0"
   },
@@ -20,6 +26,9 @@
     ],
     "compat": {
       "pluginApi": ">=2026.4.5"
+    },
+    "release": {
+      "publishToClawHub": true
     }
   }
 }
