@@ -48,14 +48,18 @@ async function initJmapClient (): Promise<void> {
   const session = await sessionRes.json() as any
 
   apiUrl = session.apiUrl
-  // Replace hostname in apiUrl with internal service URL (session returns external hostname)
-  if (apiUrl && !apiUrl.startsWith('http://stalwart')) {
+  // The session may advertise a public-facing apiUrl that isn't reachable from
+  // where the plugin runs. Rewrite its origin to match the configured JMAP_URL
+  // unless it already points there.
+  if (apiUrl) {
     const url = new URL(apiUrl)
-    const internal = new URL(JMAP_URL)
-    url.protocol = internal.protocol
-    url.hostname = internal.hostname
-    url.port = internal.port
-    apiUrl = url.toString()
+    const configured = new URL(JMAP_URL)
+    if (url.protocol !== configured.protocol || url.host !== configured.host) {
+      url.protocol = configured.protocol
+      url.hostname = configured.hostname
+      url.port = configured.port
+      apiUrl = url.toString()
+    }
   }
 
   accountId = session.primaryAccounts?.['urn:ietf:params:jmap:mail'] ?? null
@@ -441,7 +445,7 @@ let initialized = false
 export default definePluginEntry({
   id: 'openclaw-jmap-plugin',
   name: 'Email Channel (JMAP)',
-  description: 'Receives and replies to email at roci@hr-home.xyz via Stalwart JMAP with real-time SSE push',
+  description: `Receives and replies to email at ${JMAP_ACCOUNT_EMAIL} via JMAP with real-time SSE push`,
   kind: 'integration',
 
   register (api) {
@@ -463,7 +467,7 @@ export default definePluginEntry({
     api.registerTool({
       name: 'email_send',
       label: 'Send Email',
-      description: 'Send an email from roci@hr-home.xyz.\n\n' +
+      description: `Send an email from ${JMAP_ACCOUNT_EMAIL} (the configured JMAP account).\n\n` +
         'Parameters:\n' +
         '  to: recipient email address\n' +
         '  subject: email subject line\n' +

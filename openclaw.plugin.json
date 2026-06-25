@@ -13,11 +13,11 @@
   "uiHints": {
     "jmapUrl": {
       "label": "JMAP Server URL",
-      "placeholder": "http://stalwart.system:8080"
+      "placeholder": "http://localhost:8080"
     },
     "accountEmail": {
       "label": "Account Email",
-      "placeholder": "roci@hr-home.xyz"
+      "placeholder": "you@example.com"
     }
   }
 }

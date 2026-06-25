@@ -1,14 +1,14 @@
 import { describe, it, expect } from 'vitest'
 
 describe('config defaults', () => {
-  it('uses Stalwart ClusterIP as default JMAP URL', async () => {
+  it('uses localhost as default JMAP URL', async () => {
     const { JMAP_URL } = await import('../config.js')
-    expect(JMAP_URL).toBe('http://stalwart.system:8080')
+    expect(JMAP_URL).toBe('http://localhost:8080')
   })
 
-  it('uses roci@hr-home.xyz as default account email', async () => {
+  it('uses agent@example.com as default account email', async () => {
     const { JMAP_ACCOUNT_EMAIL } = await import('../config.js')
-    expect(JMAP_ACCOUNT_EMAIL).toBe('roci@hr-home.xyz')
+    expect(JMAP_ACCOUNT_EMAIL).toBe('agent@example.com')
   })
 
   it('builds EventSource URL with correct query params', async () => {
@@ -21,7 +21,7 @@ describe('config defaults', () => {
 
   it('builds session URL at .well-known/jmap', async () => {
     const { SESSION_URL } = await import('../config.js')
-    expect(SESSION_URL).toBe('http://stalwart.system:8080/.well-known/jmap')
+    expect(SESSION_URL).toBe('http://localhost:8080/.well-known/jmap')
   })
 
   it('defaults inbox-only filter to true', async () => {
